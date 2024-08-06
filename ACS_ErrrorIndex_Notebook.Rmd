@@ -1,0 +1,260 @@
+---
+title: "ACS Margin of Error Clustering and Spatial Analysis Notebook"
+author: Alex Broening
+date: Aug. 4 2024
+output: html_notebook
+---
+Description:
+
+This R Notebook is published so that other American Community Survey data users can perform spatial analysis and construct spatial indices of error rates depending on specific variables and use cases. This notebook relies on a file called index_functions.R, in which the functions used here are defined.
+
+The first part of this R Notebook runs through a full analysis and index construction, using user-defined variables and parameters. The second part provides some explanation and examples of the functions, if the user should want to use them independently.
+
+*1 - SETUP*
+
+1.1 Install and Load libraries:
+
+  sf - used for spatial data
+  spdep - used for spatial analysis 
+  sfdep - used for spatial analysis, building on spdep
+  tidyverse - used for general data handling
+  tidycensus - used for retrieving Census Bureau data
+
+```{r}
+install.packages("sf")
+install.packages("spdep")
+install.packages("sfdep")
+install.packages("tidyverse")
+install.packages("tidycensus")
+
+library(sf)
+library(sfdep)
+library(spdep)
+library(tidyverse)
+library(tidycensus)
+```
+
+1.2 Options
+
+Setup options to allow API queries and improve experience.
+
+  census_api_key(X) - X needs to be replaced with the user's individual key. Census Bureau API keys are available at     no cost at https://api.census.gov/data/key_signup.html
+
+  scipen - prevents values in dataframes appearing in scientific notation
+  tigris_use_cache - caches geometries to load API queries with TidyCensus faster
+
+```{r}
+#Options Settings
+
+census_api_key("753915d84691b3657721d57a715b97feafbbf81a")
+
+options(scipen = 999) # Prevent scientific notation
+
+options(tigris_use_cache = TRUE) # Cache geometries for faster repeated ACS API queries 
+```
+
+1.3 Set Function File
+
+Automatically set the filepath for the .R file containing the functions used here.
+
+```{r}
+path <- normalizePath(".")
+
+setwd(path)
+
+source("ErrorIndex_functions.R")
+```
+
+If this Notebook file no longer shares a folder with the functions file, the filepath of the functions file will need to be entered below.
+
+```{r}
+source()
+```
+
+1.4 Load Possible Variables
+
+Loads all possible ACS variables into a dataframe, allowing the user to browse potential variables to include in the analysis.
+
+In the load_variables() call, replace the year with the desired end-year, and the dataset with the desired dataset
+
+Parameters:
+  year - any integer from 2006 to most recent ACS publication year
+  dataset - string for dataset options: All options here:
+  https://walker-data.com/tidycensus/reference/load_variables.html
+    Suggested ACS datasets: "acs1", "acs5", "acs1/profile", "acs5/profile"
+
+```{r}
+acs_vars <- load_variables(year = 2022, dataset = "acs5") #Load the variables
+
+View(acs_vars) #View the variables
+```
+
+
+*2 - MAIN ANALYSIS*
+
+2.1 Choose Variables
+
+Initialize named vector with all desired variables for API query and analysis. 
+
+Two examples are given below, and can be replaced or added to. All variables must be entered as strings, and all items in the vector must be named. Names should be short and recognizable and all lowercase- here "mhi" is Median Household Value, and "bch" is Population with a Bachelor's Degree or Higher. 
+
+Variables should follow the pattern below:
+
+  name = "variableID",
+  
+#NOTE - Only variables representing raw values should be used; percentages do not require the later operations controlling for estimate size
+
+```{r}
+var_list <- c(
+  mhi = "B19013_001",
+  bch = "B16010_041"
+  # Repeat as necessary:
+  # NAME = "variable name"
+)
+```
+
+2.2 Choose States (If analysis at tract level)
+
+If analysis is desired at a sub-county level, a list of desired states FIPS codes must be created for the API query to complete. 
+
+Parameters:
+
+  state - a string from the options below, defining which states should be included in the list.
+    Options:
+      contig (default) - All contiguous states (recommended for spatial analyses)
+      all - All states and territories
+      all_states - All states
+      state_pr - All states and Puerto Rico
+      states_dc - All states and Washington DC
+      states_dc_pr - all states, Washington DC and Puerto Rico
+      contig_dc - all contiguous states and Washington DC
+
+```{r}
+### Create the State List
+## Arg options: "contig" (default), all", "all_states", "states_pr", "states_dc", "states_dc_pr", "contig_dc"
+state_list <- get_state_list(states = "contig")
+```
+
+The list can alternatively be manually constructed with FIPS codes as strings.
+
+```{r}
+state_list <- c()
+```
+
+2.3 Run API Call
+
+This uses Kyle Walker's TidyCensus package to call the Census Bureau API for the required information, and produce a Wide Dataframe. The function call's parameters can be altered as necessary.
+
+Parameters:
+  
+  yr - any integer from 2006 to most recent ACS publication year (lower limit is above 2006 for 5-year ACS data)\
+  level - a string for the geographic level of aggregation. Common: "block group", tract", "county", "state", "us"
+    Full options here: https://walker-data.com/tidycensus/articles/basic-usage.html#geography-in-tidycensus
+  surv - string for dataset/survey to access. Common: "acs1", "acs5"
+  dur - logical, for whether to print the elapsed time, default is FALSE.
+  
+```{r}
+outline <- acs_call(yr = 2022, level = "tract", surv = "acs5")
+```
+
+2.4 Run Data Cleaning
+
+The produced dataframe needs certain cleaning actions before it can be used in spatial analysis. 
+
+  drop_zeroes() - removes rows where all Estimate values are 0, which usually represents an atypical or problematic geography. Prints the number of cases dropped.
+  mutate_cv() - calculates Coefficients of Variation for each margin of error value, so that error can be evaluated relative to estimate
+  inf_replace() - replace "Inf" values from divide by 0 errors in the Coefficient of Variation calculations with an NA value for easier data handling later
+
+```{r}
+df <- drop_zeroes(df) #Remove problematic geographies and prints the count
+df <- mutate_cv(df) #Calculates coefficients of variation
+df <- inf_replace(df) #replaces Inf values with NA values
+```
+
+2.5 Run GI Calc
+
+Calculates the Getis Ord Gi* local clustering values for each ACS variable in the dataframe, and adds columns for each variable signifying hot/cold spot presence, as well as a final index_value column, as a sum of the variable cluster columns.
+
+Parameters:
+  nb_def. - string, neighborhood definition for spatial analysis. Options are: "knear", "queens", "rooks", "band", "inverse"
+  nb_attrib - integer, supplemental attribute for weighting neighbors - number of nearest neighbors for "knear",            distance band for "band" in kilometers, outer distance for "inverse" in kilometers
+  sim_ct. - integer, number of simulations to run in gi* analysis. Default: 999
+  sig_lev. - numeric, level of statistical significance to identify hot/cold spots. Default: 0.1
+  keep_gi. - logical, if TRUE, keeps the gi values for each variable in the output dataframe. Default: FALSE
+  keep_psim. - logical, if TRUE, keeps the p_folded_sim statistical significance values for each variable in the            output dataframe. Default: FALSE
+  keep_nb. - logical, if TRUE, keeps the neighbor list for each geography in the output dataframe. Default: FALSE
+  keep_wt. - logical, if TRUE, keeps the neighbor weight values for each geography in the output dataframe. Default:         FALSE
+  dur - logical, for whether to print the elapsed time. Default: FALSE.
+ 
+# NOTE - "inverse" IS NOT CURRENTLY SUPPORTED FOR nb_def.
+# NOTE - Run Times can be quite long for large numbers of variables, large numbers of geographies, and/or high numbers of simulations, and depending on hardware capabilities.  
+# NOTE - Runtimes for "queens" and "rooks" are longer than necessary: no-neighbors geographies cant be dropped after neighborlists are created, so the neighborhood creation function from spdep is essentially run twice.
+
+```{r}
+index <- calc_gi(sf_dataframe. = df, nb_def. = "knear", nb_attrib. = 30, sim_ct. = 999, sig_lev. = 0.1)
+```
+
+2.6 Plot it
+
+Maps the calculated values in multliple ways.
+
+2.6.1 Index Map
+
+Uses ggplot2 to plot a map of the index_values calculated above.
+
+# NOTE - Runtimes can be quite long.
+
+```{r}
+index_plot()
+```
+2.6.2 Variable Map
+
+Uses ggplot2 to plot a map of the hot/cold spots for the individual variables, as calculated above.
+
+# NOTE - Runtimes can be quite long.
+
+```{r}
+border <- get_outline()
+variable_plot(gi_dataframe = index, outline = border)
+```
+2.7 Export it
+
+Packages the dataframe as a shapefile to be stored in the same directory as this Notebook, with a user-chosen name. Expedites import into ArcGIS or other GIS platforms.
+
+  st_write() - writes the dataframe to a shapefile and associated required filetypes. Replace string with desired         filename, must end in ".shp"
+
+```{r}
+path <- normalizePath(".")
+
+setwd(path)
+
+st_write(index, "testing.shp")
+```
+
+*3 - FUNCTIONS*
+
+3.1 - API Added Functions
+
+3.1.1 - acs_call()
+
+3.2 - Cleaning Functions
+
+3.2.1 - drop_zeroes()
+
+3.2.2 - mutate_cv()
+
+3.2.3 - inf_replace()
+
+3.3 - GI* Analysis Functions
+
+3.3.1 - mutate_nbs_wts()
+
+3.3.2 - mutate_gi()
+
+3.3.3 - join_gi()
+
+3.3.4 - gi_plot()
+
+3.4 - EXTRA Functions
+
+3.4.1 - plot_per_var()
